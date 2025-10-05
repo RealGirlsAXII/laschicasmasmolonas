@@ -89,12 +89,12 @@ jobs:
           curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o fsf.zip "$ARTIFACT_URL"
           unzip -o fsf.zip -d engines/
           if [ -f engines/fairy-stockfish_x86-64-modern ]; then
-            mv engines/fairy-stockfish_x86-64-modern engines/fsf
+            mv engines/fairy-stockfish_x86-64-modern engines/fsf-latest
           else
             echo "Fairy-Stockfish binary not found!"
             exit 1
           fi
-          chmod +x engines/fsf
+          chmod +x engines/fsf-latest
       - name: Inject Lichess Bot Token
         env:
           LICHESS_TOKEN: ${{ secrets.LICHESS_TOKEN }}
