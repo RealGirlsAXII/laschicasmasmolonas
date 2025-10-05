@@ -1,6 +1,6 @@
-name: MSK Bot Runner
+name: Lichess Bot Runner
 concurrency:
-  group: msk-bot-runner
+  group: lichess-bot-runner
   cancel-in-progress: true
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ on:
         type: string
         required: false
   schedule:
-    - cron: '0 */6 * * *' # Every 6 hours
+    - cron: '0 */6 * * *' # every 6 hours
   push:
     branches: [ main ]
     paths:
@@ -38,118 +38,105 @@ permissions:
 jobs:
   bot-runner:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 355 # restart just before GitHub limit
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v5
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install tenacity pyyaml
-
-      - name: Prepare Engine Permissions
+      - name: Prepare Engine Directory
         run: |
-          echo "Setting execute permissions for engines..."
-          if [ -f engines/stockfish ]; then
-            chmod +x engines/stockfish
-            echo "✅ Stockfish permissions set"
-          else
-            echo "ERROR: engines/stockfish not found!"
-            exit 1
-          fi
-          if [ -f engines/fsf-latest ]; then
-            chmod +x engines/fsf-latest
-            echo "✅ Fairy-Stockfish permissions set"
-          else
-            echo "Warning: engines/fsf-latest not found, proceeding..."
-          fi
-          ls -l engines/  # Debug: List engine directory contents
-
-      - name: Debug MSK_TOKEN
-        env:
-          MSK_TOKEN: ${{ secrets.MSK_TOKEN }}
+          echo "Initializing engine storage..."
+          mkdir -p engines
+          sudo apt-get update && sudo apt-get install -y unzip curl
+      - name: Fetch Latest Stockfish
         run: |
-          if [ -z "$MSK_TOKEN" ]; then
-            echo "ERROR: MSK_TOKEN secret is missing or empty!"
-            exit 1
-          fi
-          echo "Debug: MSK_TOKEN length is ${#MSK_TOKEN}"
-          echo "Debug: MSK_TOKEN first 4 chars (sanitized): ${MSK_TOKEN:0:4}"
-
-      - name: Inject MSK Bot Token
-        env:
-          MSK_TOKEN: ${{ secrets.MSK_TOKEN }}
-        run: |
-          if [ -z "$MSK_TOKEN" ]; then
-            echo "ERROR: MSK_TOKEN secret is missing or empty!"
-            exit 1
-          fi
-          SANITIZED_TOKEN=$(echo "$MSK_TOKEN" | tr -d '\n\r')
-          cat << EOF > config.yml
-token: "$SANITIZED_TOKEN"
-# MSK Chess OAuth2 Token
-engines:
-  path: "./engines/stockfish"
-EOF
-          echo "✅ Token and engine config injected successfully"
-
-      - name: Verify config.yml
-        run: |
-          echo "Debug: Raw contents of config.yml:"
-          cat config.yml || echo "ERROR: config.yml is empty or missing!"
-          echo "Debug: Sanitized contents of config.yml (excluding token):"
-          grep -v '^token:' config.yml || echo "No non-token fields found in config.yml"
-          if ! grep -q '^token: \".*\"$' config.yml; then
-            echo "Warning: config.yml does not match strict token format 'token: \"...\"'"
-            if grep -q '^token: .*' config.yml; then
-              echo "✅ config.yml contains a token field, proceeding..."
-            else
-              echo "ERROR: config.yml does not contain a valid token field!"
-              exit 1
+          echo "Downloading the latest Stockfish build..."
+          mkdir -p engines
+          curl -k -L -o stockfish.zip https://abrok.eu/stockfish/latest/linux/stockfish_x64_modern.zip
+          unzip -o stockfish.zip -d engines/
+          for file in engines/stockfish_*_x64_modern; do
+            if [ -f "$file" ]; then
+              mv "$file" engines/stockfish
+              break
             fi
-          else
-            echo "✅ config.yml token format verified (strict)"
-          fi
-          if ! grep -q '^engines:' config.yml; then
-            echo "ERROR: config.yml does not contain 'engines' section!"
+          done
+          if [ ! -f engines/stockfish ]; then
+            echo "Stockfish binary not found! Extracted files:"
+            ls -la engines/
             exit 1
           fi
-          echo "✅ config.yml engines section verified"
-
+          chmod +x engines/stockfish
+      - name: Acquire Fairy-Stockfish
+        run: |
+          echo "Obtaining the latest Fairy-Stockfish..."
+          RUN_ID=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/fairy-stockfish/Fairy-Stockfish/actions/workflows/release.yml/runs?per_page=1&branch=master&status=success" \
+            | jq -r '.workflow_runs[0].id')
+          ARTIFACT_URL=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/fairy-stockfish/Fairy-Stockfish/actions/runs/$RUN_ID/artifacts" \
+            | jq -r '.artifacts[] | select(.name | contains("linux-x86-64-modern")) | .archive_download_url')
+          curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o fsf.zip "$ARTIFACT_URL"
+          unzip -o fsf.zip -d engines/
+          if [ -f engines/fairy-stockfish_x86-64-modern ]; then
+            mv engines/fairy-stockfish_x86-64-modern engines/fsf
+          else
+            echo "Fairy-Stockfish binary not found!"
+            exit 1
+          fi
+          chmod +x engines/fsf
+      - name: Inject Lichess Bot Token
+        env:
+          LICHESS_TOKEN: ${{ secrets.LICHESS_TOKEN }}
+        run: |
+          python3 << 'EOF'
+          import os, yaml
+          token = os.environ.get("LICHESS_TOKEN")
+          if not token:
+              print("ERROR: LICHESS_TOKEN secret is missing!")
+              exit(1)
+          with open("config.yml","r") as f:
+              config = yaml.safe_load(f) or {}
+          config["token"] = token
+          with open("config.yml","w") as f:
+              yaml.dump(config,f, default_flow_style=False)
+          print("✅ Token injected successfully")
+          EOF
       - name: Launch Bot
         run: |
-          echo "🤖 Starting bot..."
           CMD_BASE="python3 -u user_interface.py"
           MODE="${{ github.event.inputs.mode }}"
           TOUR_ID="${{ github.event.inputs.tournament_id }}"
           TEAM_ID="${{ github.event.inputs.team_id }}"
           PASSWORD="${{ github.event.inputs.password }}"
           if [[ "$MODE" == "matchmaking" ]]; then
-            echo "🤖 Running matchmaking mode."
-            eval "$CMD_BASE matchmaking"
+              CMD="$CMD_BASE matchmaking"
+              echo "🤖 Running command: $CMD"
+              eval "$CMD"
           elif [[ "$MODE" == "tournament" ]]; then
-            if [[ -z "$TOUR_ID" ]]; then
-              echo "⚠️ Tournament ID missing. Skipping."
-            else
-              ARGS="$TOUR_ID"
-              [[ -n "$TEAM_ID" ]] && ARGS="$ARGS $TEAM_ID"
-              [[ -n "$PASSWORD" ]] && ARGS="$ARGS $PASSWORD"
-              echo "🤖 Joining tournament: $ARGS"
-              eval "$CMD_BASE \"tournament $ARGS\""
-            fi
+              if [[ -z "$TOUR_ID" ]]; then
+                  echo "⚠️ Tournament ID missing. Skipping."
+              else
+                  ARGS="$TOUR_ID"
+                  [[ -n "$TEAM_ID" ]] && ARGS="$ARGS $TEAM_ID"
+                  [[ -n "$PASSWORD" ]] && ARGS="$ARGS $PASSWORD"
+                  echo "🤖 Joining tournament: $ARGS"
+                  eval "$CMD_BASE \"tournament $ARGS\""
+              fi
           else
-            echo "🤖 Running normal mode."
-            eval "$CMD_BASE"
+              echo "⚠️ Mode not recognized. Running normal mode."
+              eval "$CMD_BASE"
           fi
-
       - name: Auto-Restart After Timeout
         run: |
           BOT_PID=$!
